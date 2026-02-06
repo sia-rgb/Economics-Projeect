@@ -32,5 +32,5 @@ ENV DEEPSEEK_MODEL="deepseek-chat"
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令（使用 shell 格式以支持环境变量）
-CMD ["sh", "-c", "gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000"]
+# 启动命令（使用 shell 格式以支持 PORT 环境变量）
+CMD ["sh", "-c", "gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8000}"]
