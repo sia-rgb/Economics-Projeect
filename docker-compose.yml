@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  epub-analyst:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_BASE=${DEEPSEEK_API_BASE:-https://api.deepseek.com}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+    restart: unless-stopped
+    volumes:
+      # 可选：挂载日志目录
+      - ./logs:/app/logs

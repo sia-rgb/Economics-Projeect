@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+ebooklib
+beautifulsoup4
+python-docx
+httpx
+python-dotenv
