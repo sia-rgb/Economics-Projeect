@@ -24,10 +24,10 @@ COPY backend/ .
 # 复制前端构建产物
 COPY --from=frontend-builder /app/frontend/dist ./../frontend/dist
 
-# 设置环境变量（可通过 docker-compose 或运行时覆盖）
-ENV DEEPSEEK_API_KEY=""
+# 设置默认环境变量（Railway 的环境变量会覆盖这些值）
 ENV DEEPSEEK_API_BASE="https://api.deepseek.com"
 ENV DEEPSEEK_MODEL="deepseek-chat"
+# 注意：DEEPSEEK_API_KEY 不在 Dockerfile 中设置，必须通过 Railway 环境变量配置
 
 # 暴露端口
 EXPOSE 8000
