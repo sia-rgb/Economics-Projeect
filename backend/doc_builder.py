@@ -66,6 +66,9 @@ def _extract_article_title(title: str) -> str:
 # 刊名等通用标题，若提取到这些则视为无效，需从引言兜底
 _GENERIC_TITLES = frozenset({"经济学人", "the economist", "economist", "《经济学人》"})
 
+# 无意义的占位标题（如「标题」），不得作为口播稿/分析标题使用
+_INVALID_TITLE_VALUES = frozenset({"标题", "title"})
+
 
 def _derive_title_from_intro(analysis: str) -> str | None:
     """从【引言】段落提取首句或前若干字作为兜底标题。综述类引言优先提取简短栏目名。"""
@@ -259,16 +262,20 @@ def build_docx_from_analyses(
             from_epub = _extract_article_title(article.title)
             heading = (
                 _extract_title_from_analysis(analysis)
-                or (from_epub if from_epub != "未命名文章" else None)
+                or (from_epub if (from_epub and from_epub != "未命名文章" and from_epub.strip().lower() not in _INVALID_TITLE_VALUES) else None)
                 or _derive_title_from_analysis_body(analysis)
                 or "未命名文章"
             )
-        # 规范化：去掉首尾 *、去掉「标题：」前缀，保证为纯中文标题
+        # 规范化：去掉首尾 *、去掉「标题：」前缀，得到纯标题文字后统一为「标题：XX」格式
         heading = re.sub(r"^\*+|\*+$", "", heading).strip()
         heading = re.sub(r"^#?\s*标题\s*[：:]\s*", "", heading).strip()
-        if not heading:
+        if not heading or heading.strip().lower() in _INVALID_TITLE_VALUES:
             heading = "未命名文章"
+        if not heading.startswith("标题：") and not heading.startswith("标题:"):
+            heading = "标题：" + heading
         doc.add_heading(heading, level=1)
+        # 用于正文去重：仅标题文字（不含「标题：」前缀）
+        title_content = re.sub(r"^\s*标题\s*[：:]\s*", "", heading).strip() or heading
 
         # 去掉口播稿末尾固定结束语与推广/下载句，再去掉开头过渡语，然后拆段
         body_text = re.sub(r"\s*这篇文章就为您播报到这里。感谢您的收听。\s*$", "", analysis)
@@ -278,14 +285,27 @@ def build_docx_from_analyses(
         if not chunks:
             continue
 
+        # 匹配「仅标题标签」的整行（用于丢弃）；匹配段落开头的标题前缀（用于剥离）
+        _title_only_line = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*$", re.IGNORECASE)
+        _title_label_prefix = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*", re.IGNORECASE)
         for chunk in chunks:
-            # 跳过【文章标题】段落及「标题：」「**标题：」开头的段落，避免与标题重复
+            # 跳过【文章标题】段落
             if re.match(r'^【文章标题】\*?\*?\s*[：:]', chunk):
                 continue
-            if re.match(r'^\*?\*?\s*标题\s*[：:]\s*', chunk):
-                continue
-            # 跳过仅含「标题」或「**标题**」的无意义字段行
+            # 跳过仅含「标题」或「**标题**」的无意义字段行（整段只有标签时跳过）
             if re.match(r'^\s*\*?\*?\s*标题\s*\*?\*?\s*$', chunk):
+                continue
+            # 先去掉开头多行「仅标题标签」行（如 标题、#### 标题:、*###**标题: 等单独成行）
+            lines = chunk.split("\n")
+            while lines and _title_only_line.match(lines[0].strip()):
+                lines.pop(0)
+            chunk = "\n".join(lines).strip()
+            # 再剥离首行开头的「标题」/「标题：」及 Markdown 前缀
+            chunk = _title_label_prefix.sub("", chunk).strip()
+            if not chunk:
+                continue
+            # 跳过与当前标题重复的段落（首段常为「标题：XX」，已作为 heading 展示）
+            if chunk == title_content or chunk.strip() == heading:
                 continue
             doc.add_paragraph(chunk)
 
