@@ -149,13 +149,93 @@ def _extract_title_from_analysis(analysis: str) -> str | None:
     return first_line
 
 
+# 口播稿常见开头/过渡语，从正文开头去掉（标题推导与正文均用）
+_AUDIO_SCRIPT_OPENERS = re.compile(
+    r"^(?:\s*"
+    r"(?:好的,?请听这篇来自《经济学人》的文章。"
+    r"|好的,?请听《经济学人》中文(?:版)?有声书。?(?:今天是第\d+篇,?共\d+篇。?)?"
+    r"|这是《经济学人》中文(?:版)?有声书,?今天[^。]*。"
+    r"|这是《经济学人》中文(?:版)?有声书[，,]\s*第\d+篇[，,]\s*共\d+篇。?"
+    r"|这是第\d+篇[，,]\s*共\d+篇。?"
+    r"|我们为您播报[^。]*。"
+    r"|欢迎收听《经济学人》读者来信栏目。[^。]*。(?:今天是[^。]+。)?(?:本周我们选取的来信[^。]*。)?"
+    r")\s*)*",
+    re.IGNORECASE,
+)
+
+
+def _derive_title_from_analysis_body(analysis: str) -> str | None:
+    """从口播稿正文去掉常见开头后取首句作为标题兜底。若首行为无意义「标题」则跳过，用下一行。"""
+    if not analysis or not analysis.strip():
+        return None
+    rest = _AUDIO_SCRIPT_OPENERS.sub("", analysis.strip()).strip()
+    if not rest:
+        return None
+    lines = [ln.strip() for ln in rest.split("\n") if ln.strip()]
+    if not lines:
+        return None
+    # 若首行仅为「标题」或「**标题**」，丢弃该行，用下一行作为候选
+    first_clean = re.sub(r"^\*+|\*+$", "", lines[0]).strip()
+    if first_clean == "标题" and len(lines) > 1:
+        rest = "\n".join(lines[1:])
+    else:
+        rest = "\n".join(lines)
+    if not rest.strip():
+        return None
+    for sep in "。", "？", "！":
+        idx = rest.find(sep)
+        if idx >= 0:
+            first_sentence = rest[: idx + 1].strip()
+            if len(first_sentence) > 40:
+                first_sentence = first_sentence[:40] + "…"
+            return first_sentence if first_sentence else None
+    title = rest[:40].strip() + ("…" if len(rest) > 40 else "")
+    return title if title else None
+
+
+def _strip_listen_openers(text: str) -> str:
+    """去掉口播稿开头的过渡语，返回从正文开始的内容。"""
+    if not text or not text.strip():
+        return text
+    return _AUDIO_SCRIPT_OPENERS.sub("", text.strip()).strip()
+
+
+# 口播稿结尾需删除的推广/下载类句子（从文末循环剥离）
+_LISTEN_CLOSING_PATTERNS = [
+    re.compile(r"\s*要了解[^。]+《欧洲咖啡馆》[^。]*。\s*$"),
+    re.compile(r"\s*这篇文章由\s*calibre\s*从[^。]*。?\s*$", re.IGNORECASE),
+    re.compile(r"\s*请订阅[^。]*。\s*$"),
+    re.compile(r"\s*从以下[^。]*网址[^。]*下载[^。]*。?\s*$"),
+]
+
+
+def _strip_listen_closings(text: str) -> str:
+    """去掉口播稿结尾的推广/下载类句子，返回清理后的内容。"""
+    if not text or not text.strip():
+        return text
+    body = text.strip()
+    changed = True
+    while changed:
+        changed = False
+        for pat in _LISTEN_CLOSING_PATTERNS:
+            new_body = pat.sub("", body).strip()
+            if new_body != body:
+                body = new_body
+                changed = True
+    return body
+
+
 def build_docx_from_analyses(
     analyses: List[str],
     articles: List[Article],
+    titles_override: List[str] | None = None,
 ) -> BytesIO:
-    """将所有文章的中文分析结果写入单一 Word 文档并返回内存流。"""
+    """将所有文章的中文分析结果写入单一 Word 文档并返回内存流。
+    titles_override: 若提供且与 analyses 等长，则优先用其非空项作为标题（与「看我」一致）。"""
     if len(analyses) != len(articles):
         raise ValueError("analyses 与 articles 数量不一致。")
+    if titles_override is not None and len(titles_override) != len(articles):
+        raise ValueError("titles_override 与 articles 数量不一致。")
 
     doc = Document()
 
@@ -170,23 +250,136 @@ def build_docx_from_analyses(
     heading_font = heading_style.font
     _set_font_chinese_english(heading_font, "微软雅黑", "Times New Roman")
 
-    for article, analysis in zip(articles, analyses, strict=True):
-        # 优先从分析结果中提取标题，否则用 EPUB 元数据
-        heading = _extract_title_from_analysis(analysis) or _extract_article_title(article.title)
+    for i, (article, analysis) in enumerate(zip(articles, analyses, strict=True)):
+        # 优先用「看我」翻译标题，否则从分析/EPUB/口播稿正文推导
+        from_override = (titles_override[i] or "").strip() if titles_override else ""
+        if from_override and from_override != "未命名文章":
+            heading = from_override
+        else:
+            from_epub = _extract_article_title(article.title)
+            heading = (
+                _extract_title_from_analysis(analysis)
+                or (from_epub if from_epub != "未命名文章" else None)
+                or _derive_title_from_analysis_body(analysis)
+                or "未命名文章"
+            )
+        # 规范化：去掉首尾 *、去掉「标题：」前缀，保证为纯中文标题
+        heading = re.sub(r"^\*+|\*+$", "", heading).strip()
+        heading = re.sub(r"^#?\s*标题\s*[：:]\s*", "", heading).strip()
+        if not heading:
+            heading = "未命名文章"
         doc.add_heading(heading, level=1)
 
-        # 将分析文本按空行拆成段落
-        chunks = [chunk.strip() for chunk in analysis.split("\n\n") if chunk.strip()]
+        # 去掉口播稿末尾固定结束语与推广/下载句，再去掉开头过渡语，然后拆段
+        body_text = re.sub(r"\s*这篇文章就为您播报到这里。感谢您的收听。\s*$", "", analysis)
+        body_text = _strip_listen_closings(body_text)
+        body_text = _strip_listen_openers(body_text)
+        chunks = [chunk.strip() for chunk in body_text.split("\n\n") if chunk.strip()]
         if not chunks:
             continue
 
         for chunk in chunks:
-            # 跳过【文章标题】段落，避免与标题重复
+            # 跳过【文章标题】段落及「标题：」「**标题：」开头的段落，避免与标题重复
             if re.match(r'^【文章标题】\*?\*?\s*[：:]', chunk):
+                continue
+            if re.match(r'^\*?\*?\s*标题\s*[：:]\s*', chunk):
+                continue
+            # 跳过仅含「标题」或「**标题**」的无意义字段行
+            if re.match(r'^\s*\*?\*?\s*标题\s*\*?\*?\s*$', chunk):
                 continue
             doc.add_paragraph(chunk)
 
         # 章节之间空一页或空几行，这里简单空两行
+        doc.add_paragraph()
+        doc.add_paragraph()
+
+    stream = BytesIO()
+    doc.save(stream)
+    stream.seek(0)
+    return stream
+
+
+def _parse_translation(translation: str) -> tuple[str, str, str | None]:
+    """
+    从单条翻译文本解析出：标题、正文、译者注（可选）。
+    返回 (title, body, translator_note_or_none)。
+    """
+    text = (translation or "").strip()
+    if not text:
+        return ("未命名文章", "", None)
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ("未命名文章", "", None)
+
+    # 标题：首行匹配「标题：」或「【…】」则取该行/括号内容；否则取第一行或前 80 字
+    first = lines[0]
+    title = "未命名文章"
+    title_match = re.match(r"#?\s*标题\s*[：:]\s*(.+)", first)
+    if title_match:
+        title = title_match.group(1).strip()
+        if len(title) > 80:
+            title = title[:80]
+    else:
+        bracket = re.search(r"【([^】]+)】", first)
+        if bracket:
+            title = bracket.group(1).strip()
+        else:
+            title = first[:80] if len(first) > 80 else first
+
+    # 正文与译者注：从标题后到「译者注：」之前为正文；若有「译者注：」则单独一段
+    rest = "\n\n".join(lines[1:]) if len(lines) > 1 else ""
+    translator_note = None
+    body = rest
+
+    note_marker = re.search(r"译者注\s*[：:]\s*", rest)
+    if note_marker:
+        body = rest[: note_marker.start()].strip()
+        translator_note = rest[note_marker.end() :].strip()
+
+    title = re.sub(r"^\*+|\*+$", "", title).strip()
+    title = re.sub(r"^#?\s*标题\s*[：:]\s*", "", title).strip()
+    if not title:
+        title = "未命名文章"
+
+    return (title, body, translator_note if translator_note else None)
+
+
+def build_docx_from_translations(
+    translations: List[str],
+    articles: List[Article],
+) -> BytesIO:
+    """将全文翻译结果写入单一 Word 文档并返回内存流。"""
+    if len(translations) != len(articles):
+        raise ValueError("translations 与 articles 数量不一致。")
+
+    doc = Document()
+
+    style = doc.styles["Normal"]
+    font = style.font
+    _set_font_chinese_english(font, "微软雅黑", "Times New Roman")
+    font.size = Pt(11)
+
+    heading_style = doc.styles["Heading 1"]
+    heading_font = heading_style.font
+    _set_font_chinese_english(heading_font, "微软雅黑", "Times New Roman")
+
+    for i, (article, raw_translation) in enumerate(zip(articles, translations, strict=True)):
+        title, body, translator_note = _parse_translation(raw_translation)
+        if title == "未命名文章" and body == "" and not translator_note:
+            title = _extract_article_title(article.title) or "未命名文章"
+
+        doc.add_heading(title, level=1)
+
+        for para in body.split("\n\n"):
+            para = para.strip()
+            if para:
+                doc.add_paragraph(para)
+
+        if translator_note:
+            doc.add_paragraph()
+            doc.add_paragraph("译者注：" + translator_note)
+
         doc.add_paragraph()
         doc.add_paragraph()
 

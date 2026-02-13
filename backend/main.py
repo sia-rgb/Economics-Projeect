@@ -24,10 +24,17 @@ from pathlib import Path
 
 import asyncio
 import re
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from epub_processing import extract_articles_from_epub
-from deepseek_client import analyze_article_with_deepseek, DeepSeekError
-from doc_builder import build_docx_from_analyses, _extract_title_from_analysis, _extract_article_title
+from deepseek_client import analyze_article_with_deepseek, translate_article_with_deepseek, DeepSeekError
+from doc_builder import (
+    build_docx_from_analyses,
+    build_docx_from_translations,
+    _extract_title_from_analysis,
+    _extract_article_title,
+    _parse_translation,
+)
 
 
 app = FastAPI(title="EPUB Analyst")
@@ -51,10 +58,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_executor = ThreadPoolExecutor(max_workers=20)
-_semaphore = asyncio.Semaphore(20)
+MAX_PARALLEL_TASKS = int(os.getenv("MAX_PARALLEL_TASKS", "20"))
+_executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_TASKS)
+_semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
 _status_lock = asyncio.Lock()
 _processing_status: dict[str, dict] = {}  # 存储处理状态
+_results_store: dict[str, dict] = {}  # task_id -> { "read_docx": bytes, "listen_docx": bytes, "base_name": str }
+
+
+def _content_disposition_utf8(filename: str, fallback: str) -> str:
+    """RFC 5987: use filename*=UTF-8'' for non-ASCII filenames to avoid Latin-1 encode errors."""
+    encoded = quote(filename, safe="")
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
 def _is_cartoon_article(article, analysis: str) -> bool:
@@ -64,6 +79,17 @@ def _is_cartoon_article(article, analysis: str) -> bool:
     analysis_start = (analysis or "")[:500]
     keywords = ["漫画", "cartoon", "comic", "每周漫画", "weekly cartoon"]
     return any(kw in title_lower or kw in analysis_start for kw in keywords)
+
+
+def _is_cartoon_translation(article, translation: str) -> bool:
+    """根据解析出的标题或翻译内容判断是否为漫画类。"""
+    title, body, _ = _parse_translation(translation)
+    if not title:
+        title = _extract_article_title(article.title) or ""
+    title_lower = title.lower()
+    text_start = (translation or "")[:500]
+    keywords = ["漫画", "cartoon", "comic", "每周漫画", "weekly cartoon"]
+    return any(kw in title_lower or kw in text_start for kw in keywords)
 
 
 def _should_exclude_article(article, analysis: str) -> bool:
@@ -123,6 +149,36 @@ async def _process_single_article(
             return (index, analysis, None)
         except DeepSeekError as e:
             _trace(f"STEP_ERR: DeepSeekError article={index} error={str(e)}")
+            return (index, None, str(e))
+
+
+async def _process_single_translation(
+    article,
+    index: int,
+    total: int,
+    api_key: str,
+    task_id: str,
+) -> tuple[int, str | None, str | None]:
+    """处理单篇翻译，返回 (index, translation, error)。成功时 error 为 None。"""
+    async with _semaphore:
+        _trace(f"TRANSLATE: calling DeepSeek for article {index}/{total}")
+        try:
+            loop = asyncio.get_event_loop()
+            translation = await loop.run_in_executor(
+                _executor,
+                lambda a=article, i=index, t=total, k=api_key: translate_article_with_deepseek(
+                    article=a, index=i, total=t, api_key=k, timeout_seconds=180.0
+                ),
+            )
+            async with _status_lock:
+                if task_id in _processing_status:
+                    _processing_status[task_id]["current"] = (
+                        _processing_status[task_id].get("current", 0) + 1
+                    )
+            _trace(f"TRANSLATE_DONE: article {index}/{total} completed")
+            return (index, translation, None)
+        except DeepSeekError as e:
+            _trace(f"TRANSLATE_ERR: article={index} error={str(e)}")
             return (index, None, str(e))
 
 
@@ -201,9 +257,8 @@ async def analyze_epub(file: UploadFile = File(...)) -> StreamingResponse:
         _processing_status[task_id]["status"] = "completed"
         base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "analysis_result"
         docx_name = f"{base_name}.docx"
-        headers = {
-            "Content-Disposition": f'attachment; filename="{docx_name}"'
-        }
+        fallback = docx_name if docx_name.isascii() else "analysis_result.docx"
+        headers = {"Content-Disposition": _content_disposition_utf8(docx_name, fallback)}
         return StreamingResponse(
             doc_stream,
             media_type=(
@@ -224,6 +279,219 @@ async def analyze_epub(file: UploadFile = File(...)) -> StreamingResponse:
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+@app.post("/api/translate-epub")
+async def translate_epub(file: UploadFile = File(...)) -> StreamingResponse:
+    """上传 EPUB，全文翻译后生成 Word 并流式返回。"""
+    import uuid
+    task_id = str(uuid.uuid4())
+    _processing_status[task_id] = {"status": "processing", "current": 0, "total": 0}
+    _trace("TRANSLATE_STEP0: request started", clear=True)
+    if not file.filename.lower().endswith(".epub"):
+        raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
+        )
+
+    try:
+        _trace("TRANSLATE_STEP1: reading file")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        _trace("TRANSLATE_STEP2: extracting articles")
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
+
+        total = len(articles)
+        _processing_status[task_id]["total"] = total
+
+        tasks = [
+            _process_single_translation(article, idx, total, api_key, task_id)
+            for idx, article in enumerate(articles, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        successful = [(idx, trans) for idx, trans, err in results if err is None]
+        failed = [(idx, err) for idx, trans, err in results if err is not None]
+
+        if not successful:
+            failed_detail = "; ".join(f"第{i}篇: {e}" for i, e in failed[:5])
+            if len(failed) > 5:
+                failed_detail += f" ... 共{len(failed)}篇失败"
+            _processing_status[task_id] = {"status": "error", "error": failed_detail}
+            raise HTTPException(status_code=502, detail=f"所有文章翻译失败: {failed_detail}")
+
+        sorted_successful = sorted(successful, key=lambda x: x[0])
+        filtered = [
+            (idx, trans)
+            for idx, trans in sorted_successful
+            if not _is_cartoon_translation(articles[idx - 1], trans)
+        ]
+        translations = [trans for _, trans in filtered]
+        articles_for_doc = [articles[idx - 1] for idx, _ in filtered]
+
+        if failed:
+            _processing_status[task_id]["failed_count"] = len(failed)
+            _processing_status[task_id]["failed_indices"] = [i for i, _ in failed]
+
+        _trace("TRANSLATE_STEP4: building docx")
+        _processing_status[task_id]["status"] = "building_docx"
+        doc_stream: BytesIO = build_docx_from_translations(translations, articles_for_doc)
+        _processing_status[task_id]["status"] = "completed"
+        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "translation_result"
+        docx_name = f"{base_name}.docx"
+        fallback = docx_name if docx_name.isascii() else "translation_result.docx"
+        headers = {"Content-Disposition": _content_disposition_utf8(docx_name, fallback)}
+        return StreamingResponse(
+            doc_stream,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            headers=headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _trace(f"TRANSLATE_UNHANDLED: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
+    finally:
+        try:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/point-me")
+async def point_me(file: UploadFile = File(...)) -> JSONResponse:
+    """点我：同时跑「看我」（书面翻译）与「听我」（口播稿），结果按 task_id 存，供读我/听我下载。"""
+    import uuid
+    task_id = str(uuid.uuid4())
+    if not file.filename or not file.filename.lower().endswith(".epub"):
+        raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
+        )
+    try:
+        content = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
+        total_n = len(articles)
+        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
+        _processing_status[task_id] = {"status": "processing", "current": 0, "total": 2 * total_n}
+
+        async def flow_listen() -> tuple[list[str], list, list[tuple[int, str]]]:
+            tasks = [
+                _process_single_article(art, idx, total_n, api_key, task_id)
+                for idx, art in enumerate(articles, start=1)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            successful = [(idx, a) for idx, a, err in results if err is None]
+            if not successful:
+                raise HTTPException(status_code=502, detail="听我：所有文章口播稿生成失败")
+            filtered = [
+                (idx, a) for idx, a in sorted(successful, key=lambda x: x[0])
+                if a.strip() != "【不生成口播稿】"
+                and not _is_cartoon_article(articles[idx - 1], a)
+                and not _should_exclude_article(articles[idx - 1], a)
+            ]
+            analyses = [a for _, a in filtered]
+            arts = [articles[i - 1] for i, _ in filtered]
+            return (analyses, arts, filtered)
+
+        async def flow_read() -> tuple[list[str], list, list[tuple[int, str]]]:
+            tasks = [
+                _process_single_translation(art, idx, total_n, api_key, task_id)
+                for idx, art in enumerate(articles, start=1)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            successful = [(idx, t) for idx, t, err in results if err is None]
+            if not successful:
+                raise HTTPException(status_code=502, detail="看我：所有文章翻译失败")
+            filtered = [
+                (idx, t) for idx, t in sorted(successful, key=lambda x: x[0])
+                if not _is_cartoon_translation(articles[idx - 1], t)
+            ]
+            translations = [t for _, t in filtered]
+            arts = [articles[i - 1] for i, _ in filtered]
+            return (translations, arts, filtered)
+
+        (analyses, arts_listen, listen_filtered), (translations, arts_read, read_filtered) = await asyncio.gather(flow_listen(), flow_read())
+        read_title_map = {idx: _parse_translation(t)[0] for idx, t in read_filtered}
+        titles_for_listen = [read_title_map.get(idx, "") for idx, _ in listen_filtered]
+        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=titles_for_listen)
+        read_docx = build_docx_from_translations(translations, arts_read)
+        listen_docx.seek(0)
+        read_docx.seek(0)
+        _results_store[task_id] = {
+            "read_docx": read_docx.getvalue(),
+            "listen_docx": listen_docx.getvalue(),
+            "base_name": base_name,
+        }
+        _processing_status[task_id]["status"] = "completed"
+        return JSONResponse({"task_id": task_id, "status": "completed"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _trace(f"POINT_ME_UNHANDLED: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
+    finally:
+        try:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+@app.get("/api/download/read/{task_id}")
+def download_read(task_id: str):
+    """下载「看我」Word：看+（上传文件名）.docx"""
+    if task_id not in _results_store:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    base_name = _results_store[task_id]["base_name"]
+    docx_bytes = _results_store[task_id]["read_docx"]
+    filename = f"看{base_name}.docx"
+    fallback = f"read_{base_name}.docx"
+    cd_header = _content_disposition_utf8(filename, fallback)
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": cd_header},
+    )
+
+
+@app.get("/api/download/listen/{task_id}")
+def download_listen(task_id: str):
+    """下载「听我」Word：听+（上传文件名）.docx"""
+    if task_id not in _results_store:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    base_name = _results_store[task_id]["base_name"]
+    docx_bytes = _results_store[task_id]["listen_docx"]
+    filename = f"听{base_name}.docx"
+    fallback = f"listen_{base_name}.docx"
+    cd_header = _content_disposition_utf8(filename, fallback)
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": cd_header},
+    )
 
 
 @app.get("/health")
