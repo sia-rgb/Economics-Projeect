@@ -79,7 +79,7 @@ DEBUG_EPUB_HTML = os.environ.get("DEBUG_EPUB_HTML", "").strip().lower() in ("1",
 
 
 def _normalize_href(item_or_href: Union[epub.EpubItem, str]) -> str:
-    """归一化 href 便于与 TOC 匹配：小写、去掉 fragment、统一路径分隔符。"""
+    """归一化 href 便于与 TOC 匹配：小写、去掉 fragment、统一路径分隔符，最终仅保留文件名。"""
     if hasattr(item_or_href, "get_name"):
         href = item_or_href.get_name() or ""
     else:
@@ -88,7 +88,8 @@ def _normalize_href(item_or_href: Union[epub.EpubItem, str]) -> str:
     href = re.sub(r"/+", "/", href)
     if href.startswith("../"):
         href = href[3:]
-    return href.strip("/") or href
+    href = href.strip("/") or href
+    return os.path.basename(href)
 
 
 def _build_toc_title_by_href(book: epub.EpubBook) -> Dict[str, str]:
@@ -177,8 +178,7 @@ def _normalize_article_title_and_body(item_title: str, full_text: str) -> Tuple[
 
 def _html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
+    _clean_soup(soup)
     text = soup.get_text(separator="\n")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
@@ -191,73 +191,113 @@ def _tag_text(tag) -> str:
     return " ".join(tag.stripped_strings) or tag.get_text(separator=" ", strip=True)
 
 
+def _clean_soup(soup: BeautifulSoup) -> None:
+    """清除 HTML 中的非正文干扰元素，防止其污染标题与正文首行。"""
+    for tag in soup([
+        "script",
+        "style",
+        "noscript",
+        "aside",
+        "footer",
+        "nav",
+        "header",
+        "figure",
+        "img",
+    ]):
+        tag.decompose()
+    for tag in soup.find_all(class_=re.compile(r"(nav|pagination|breadcrumb|header|footer|toc)", re.I)):
+        tag.decompose()
+
+
 def _extract_title_and_body_from_html(
     html: str, item_title: str, toc_title: str | None
 ) -> Tuple[str, str]:
-    """基于语义标签提取标题与正文：优先 h1/headline，再 TOC，再首行回退。"""
+    """提取标题与正文：优先 TOC → <title> → 语义标签 → 启发式首行回退。"""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "aside", "footer", "nav"]):
-        tag.decompose()
+    # 先从 <head> 中提取潜在标题
+    head_title = ""
+    title_tag = soup.find("title")
+    if title_tag and title_tag.string:
+        head_title = title_tag.string.strip()
 
-    semantic_title = ""
+    # 清理干扰元素
+    _clean_soup(soup)
+
+    final_title = ""
     title_node = None
-    h1 = soup.find("h1")
-    if h1:
-        semantic_title = _tag_text(h1).strip()[:200]
-        title_node = h1
-    if (not semantic_title or _is_placeholder_title(semantic_title)) and not title_node:
-        headline = soup.select_one(
-            "[class*='headline'], [class*='article__headline'], [class*='main-title']"
-        )
-        if headline:
-            semantic_title = _tag_text(headline).strip()[:200]
-            title_node = headline
-    if semantic_title and _is_placeholder_title(semantic_title):
-        semantic_title = ""
-    if semantic_title and title_node and not _is_placeholder_title(semantic_title):
-        if title_node.name == "h3" or (h1 is None and soup.find("h3")):
-            h3_node = title_node if title_node.name == "h3" else soup.find("h3")
-            if h3_node:
-                h3_text = _tag_text(h3_node).strip().lower()
-                if _is_roundup_or_dynamic_section(h3_text) or any(
-                    kw in h3_text for kw in ("leaders", "briefing", "letters")
-                ):
-                    semantic_title = ""
 
-    if not semantic_title and toc_title and not _is_placeholder_title(toc_title):
-        final_title = toc_title.strip()[:200]
-    elif semantic_title:
-        final_title = semantic_title
-    else:
+    # 优先级 1：TOC 中提供的标题
+    if toc_title and not _is_placeholder_title(toc_title):
+        final_title = toc_title.strip()
+
+    # 优先级 2: 语义化标签 (扩大范围，兼容 Calibre 和常见抓取模板)
+    if not final_title:
+        for selector in [
+            "h1", "h2.title", ".article_title", ".calibre_feed_title",
+            "[class*='headline']", "[class*='main-title']",
+            "h2", "h3",
+        ]:
+            node = soup.select_one(selector)
+            if node:
+                text = _tag_text(node).strip()
+                if text and not _is_placeholder_title(text) and text.lower() != "the economist":
+                    final_title = text
+                    title_node = node
+                    break
+
+    # 优先级 3: HTML 原生 <title> 标签 (过滤全局统一名称)
+    if not final_title and head_title and not _is_placeholder_title(head_title):
+        if head_title.lower() not in ("the economist", "calibre"):
+            final_title = head_title
+
+    # 优先级 4：启发式首行回退
+    if not final_title:
         full_text = soup.get_text(separator="\n")
         lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
         full_text_clean = "\n".join(lines)
         final_title, body_only = _normalize_article_title_and_body(
             item_title, full_text_clean
         )
-        return (final_title, body_only)
+        return final_title, body_only
 
     if _is_placeholder_title(final_title):
         final_title = "未命名文章"
 
+    # 若找到了正文内的标题节点，将其移除以避免在正文中重复出现
     if title_node:
         title_node.decompose()
+
+    # 提取并清理正文
     full_text = soup.get_text(separator="\n")
     lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
+
     body_lines: List[str] = []
     for ln in lines:
-        if ln.lower().strip() == final_title.lower().strip():
+        ln_lower = ln.lower().strip()
+        if ln_lower == final_title.lower().strip():
             continue
-        if _is_roundup_or_dynamic_section(ln.lower()) and len(body_lines) < 3:
+        if _is_roundup_or_dynamic_section(ln_lower) and len(body_lines) < 3:
             continue
         body_lines.append(ln)
+
+    # 去除开头短句/导语
     if body_lines:
         for idx, ln in enumerate(body_lines):
             if len(ln.strip()) >= MIN_BODY_LINE_CHARS:
                 body_lines = body_lines[idx:]
                 break
+
     body_only = "\n".join(body_lines).strip() if body_lines else full_text
-    return (final_title or "未命名文章", body_only)
+
+    # 清洗标题前缀：RSS/Calibre 常硬编码「标题：」「Title:」等，去掉后还原为纯标题
+    if final_title and final_title != "未命名文章":
+        final_title = re.sub(
+            r"^(?:标题|文章标题|title)\s*[:：\-]?\s*", "", final_title, flags=re.IGNORECASE
+        ).strip()
+        if not final_title or _is_placeholder_title(final_title):
+            final_title = "未命名文章"
+
+    return (final_title[:200] if final_title else "未命名文章", body_only)
 
 
 def extract_articles_from_epub(path: str) -> List[Article]:
@@ -341,6 +381,13 @@ def extract_articles_from_epub(path: str) -> List[Article]:
         final_title, body_only = _extract_title_and_body_from_html(
             raw_html, title, toc_title
         )
+
+        if final_title == "未命名文章":
+            print(f"[DEBUG] 检测到未命名文章 | 文件路径: {item.get_name()}")
+            print(f"        正文前80字: {body_only[:80].replace(chr(10), ' ')}")
+            print("-" * 50)
+            continue
+
         articles.append(Article(title=final_title, content=body_only))
 
     return articles

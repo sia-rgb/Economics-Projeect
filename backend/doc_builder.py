@@ -253,63 +253,72 @@ def build_docx_from_analyses(
     heading_font = heading_style.font
     _set_font_chinese_english(heading_font, "微软雅黑", "Times New Roman")
 
-    for i, (article, analysis) in enumerate(zip(articles, analyses, strict=True)):
-        # 优先用「看我」翻译标题，否则从分析/EPUB/口播稿正文推导
+    # 预计算每篇的纯标题，过滤掉「未命名文章」后只写入保留项并重新编号
+    pure_headings: List[str] = []
+    for i in range(len(articles)):
+        article = articles[i]
+        analysis = analyses[i]
         from_override = (titles_override[i] or "").strip() if titles_override else ""
         if from_override and from_override != "未命名文章":
-            heading = from_override
+            h = from_override
         else:
             from_epub = _extract_article_title(article.title)
-            heading = (
+            h = (
                 _extract_title_from_analysis(analysis)
                 or (from_epub if (from_epub and from_epub != "未命名文章" and from_epub.strip().lower() not in _INVALID_TITLE_VALUES) else None)
                 or _derive_title_from_analysis_body(analysis)
                 or "未命名文章"
             )
-        # 规范化：去掉首尾 *、去掉「标题：」前缀，得到纯标题文字后统一为「标题：XX」格式
-        heading = re.sub(r"^\*+|\*+$", "", heading).strip()
-        heading = re.sub(r"^#?\s*标题\s*[：:]\s*", "", heading).strip()
-        if not heading or heading.strip().lower() in _INVALID_TITLE_VALUES:
-            heading = "未命名文章"
-        if not heading.startswith("标题：") and not heading.startswith("标题:"):
-            heading = "标题：" + heading
-        doc.add_heading(heading, level=1)
-        # 用于正文去重：仅标题文字（不含「标题：」前缀）
-        title_content = re.sub(r"^\s*标题\s*[：:]\s*", "", heading).strip() or heading
+        h = re.sub(r"^\*+|\*+$", "", h).strip()
+        h = re.sub(r"^#?\s*标题\s*[：:]\s*", "", h).strip()
+        h = re.sub(r"^[\s#*]+", "", h).strip()
+        h = re.sub(r"^(?:标题|文章标题|title)\s*[*]*\s*[：:]\s*", "", h, flags=re.IGNORECASE).strip()
+        if not h or h.strip().lower() in _INVALID_TITLE_VALUES:
+            h = "未命名文章"
+        pure_headings.append(h)
+    keep_indices = [i for i in range(len(articles)) if pure_headings[i] != "未命名文章"]
+
+    _title_only_line = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*$", re.IGNORECASE)
+    _title_label_prefix = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*", re.IGNORECASE)
+    display_index = 0
+
+    for idx in keep_indices:
+        analysis = analyses[idx]
+        pure_heading = pure_headings[idx]
+        title_content = pure_heading
+        dummy_heading = f"文章0：{pure_heading}"
 
         # 去掉口播稿末尾固定结束语与推广/下载句，再去掉开头过渡语，然后拆段
         body_text = re.sub(r"\s*这篇文章就为您播报到这里。感谢您的收听。\s*$", "", analysis)
         body_text = _strip_listen_closings(body_text)
         body_text = _strip_listen_openers(body_text)
         chunks = [chunk.strip() for chunk in body_text.split("\n\n") if chunk.strip()]
-        if not chunks:
-            continue
 
-        # 匹配「仅标题标签」的整行（用于丢弃）；匹配段落开头的标题前缀（用于剥离）
-        _title_only_line = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*$", re.IGNORECASE)
-        _title_label_prefix = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*", re.IGNORECASE)
+        paragraphs_to_add: List[str] = []
         for chunk in chunks:
-            # 跳过【文章标题】段落
             if re.match(r'^【文章标题】\*?\*?\s*[：:]', chunk):
                 continue
-            # 跳过仅含「标题」或「**标题**」的无意义字段行（整段只有标签时跳过）
             if re.match(r'^\s*\*?\*?\s*标题\s*\*?\*?\s*$', chunk):
                 continue
-            # 先去掉开头多行「仅标题标签」行（如 标题、#### 标题:、*###**标题: 等单独成行）
             lines = chunk.split("\n")
             while lines and _title_only_line.match(lines[0].strip()):
                 lines.pop(0)
             chunk = "\n".join(lines).strip()
-            # 再剥离首行开头的「标题」/「标题：」及 Markdown 前缀
             chunk = _title_label_prefix.sub("", chunk).strip()
             if not chunk:
                 continue
-            # 跳过与当前标题重复的段落（首段常为「标题：XX」，已作为 heading 展示）
-            if chunk == title_content or chunk.strip() == heading:
+            if chunk == title_content or chunk.strip() == dummy_heading:
                 continue
-            doc.add_paragraph(chunk)
+            paragraphs_to_add.append(chunk)
 
-        # 章节之间空一页或空几行，这里简单空两行
+        if not paragraphs_to_add:
+            continue
+
+        display_index += 1
+        heading = f"文章{display_index}：{pure_heading}"
+        doc.add_heading(heading, level=1)
+        for p in paragraphs_to_add:
+            doc.add_paragraph(p)
         doc.add_paragraph()
         doc.add_paragraph()
 
