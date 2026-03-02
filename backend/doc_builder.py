@@ -228,6 +228,41 @@ def _strip_listen_closings(text: str) -> str:
     return body
 
 
+def get_pure_headings(
+    articles: List[Article],
+    analyses: List[str],
+    titles_override: List[str] | None = None,
+) -> List[str]:
+    """预计算每篇的纯标题（与 build_docx_from_analyses 内逻辑一致），供调用方做标题翻译等后处理。"""
+    if len(analyses) != len(articles):
+        raise ValueError("analyses 与 articles 数量不一致。")
+    if titles_override is not None and len(titles_override) != len(articles):
+        raise ValueError("titles_override 与 articles 数量不一致。")
+    pure_headings: List[str] = []
+    for i in range(len(articles)):
+        article = articles[i]
+        analysis = analyses[i]
+        from_override = (titles_override[i] or "").strip() if titles_override else ""
+        if from_override and from_override != "未命名文章":
+            h = from_override
+        else:
+            from_epub = _extract_article_title(article.title)
+            h = (
+                _extract_title_from_analysis(analysis)
+                or (from_epub if (from_epub and from_epub != "未命名文章" and from_epub.strip().lower() not in _INVALID_TITLE_VALUES) else None)
+                or _derive_title_from_analysis_body(analysis)
+                or "未命名文章"
+            )
+        h = re.sub(r"^\*+|\*+$", "", h).strip()
+        h = re.sub(r"^#?\s*标题\s*[：:]\s*", "", h).strip()
+        h = re.sub(r"^[\s#*]+", "", h).strip()
+        h = re.sub(r"^(?:标题|文章标题|title)\s*[*]*\s*[：:]\s*", "", h, flags=re.IGNORECASE).strip()
+        if not h or h.strip().lower() in _INVALID_TITLE_VALUES:
+            h = "未命名文章"
+        pure_headings.append(h)
+    return pure_headings
+
+
 def build_docx_from_analyses(
     analyses: List[str],
     articles: List[Article],
@@ -253,29 +288,7 @@ def build_docx_from_analyses(
     heading_font = heading_style.font
     _set_font_chinese_english(heading_font, "微软雅黑", "Times New Roman")
 
-    # 预计算每篇的纯标题，过滤掉「未命名文章」后只写入保留项并重新编号
-    pure_headings: List[str] = []
-    for i in range(len(articles)):
-        article = articles[i]
-        analysis = analyses[i]
-        from_override = (titles_override[i] or "").strip() if titles_override else ""
-        if from_override and from_override != "未命名文章":
-            h = from_override
-        else:
-            from_epub = _extract_article_title(article.title)
-            h = (
-                _extract_title_from_analysis(analysis)
-                or (from_epub if (from_epub and from_epub != "未命名文章" and from_epub.strip().lower() not in _INVALID_TITLE_VALUES) else None)
-                or _derive_title_from_analysis_body(analysis)
-                or "未命名文章"
-            )
-        h = re.sub(r"^\*+|\*+$", "", h).strip()
-        h = re.sub(r"^#?\s*标题\s*[：:]\s*", "", h).strip()
-        h = re.sub(r"^[\s#*]+", "", h).strip()
-        h = re.sub(r"^(?:标题|文章标题|title)\s*[*]*\s*[：:]\s*", "", h, flags=re.IGNORECASE).strip()
-        if not h or h.strip().lower() in _INVALID_TITLE_VALUES:
-            h = "未命名文章"
-        pure_headings.append(h)
+    pure_headings = get_pure_headings(articles, analyses, titles_override)
     keep_indices = [i for i in range(len(articles)) if pure_headings[i] != "未命名文章"]
 
     _title_only_line = re.compile(r"^\s*(?:#+\s*|\|\s*|\*+\s*)*标题\s*[：:]*\s*$", re.IGNORECASE)

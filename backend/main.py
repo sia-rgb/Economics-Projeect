@@ -27,10 +27,16 @@ import re
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from epub_processing import extract_articles_from_epub
-from deepseek_client import analyze_article_with_deepseek, translate_article_with_deepseek, DeepSeekError
+from deepseek_client import (
+    analyze_article_with_deepseek,
+    translate_article_with_deepseek,
+    translate_title_to_chinese,
+    DeepSeekError,
+)
 from doc_builder import (
     build_docx_from_analyses,
     build_docx_from_translations,
+    get_pure_headings,
     _extract_title_from_analysis,
     _extract_article_title,
     _parse_translation,
@@ -70,6 +76,16 @@ def _content_disposition_utf8(filename: str, fallback: str) -> str:
     """RFC 5987: use filename*=UTF-8'' for non-ASCII filenames to avoid Latin-1 encode errors."""
     encoded = quote(filename, safe="")
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _is_title_mostly_english(title: str) -> bool:
+    """判断标题是否主要为英文，用于口播稿标题兜底翻译。"""
+    if not title or not title.strip():
+        return False
+    t = title.strip()
+    cjk = re.findall(r"[\u4e00-\u9fff]", t)
+    has_latin = bool(re.search(r"[a-zA-Z]", t))
+    return has_latin and (len(cjk) < 2 or len(cjk) < len(t) * 0.3)
 
 
 def _is_cartoon_article(article, analysis: str) -> bool:
@@ -501,7 +517,21 @@ async def listen_me(file: UploadFile = File(...)) -> JSONResponse:
         ]
         analyses = [a for _, a in filtered]
         arts_listen = [articles[i - 1] for i, _ in filtered]
-        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=None)
+        pure_headings = get_pure_headings(arts_listen, analyses, None)
+        titles_final: List[str] = []
+        for i, h in enumerate(pure_headings):
+            if h == "未命名文章" or not _is_title_mostly_english(h):
+                titles_final.append(h)
+            else:
+                try:
+                    translated = await asyncio.get_event_loop().run_in_executor(
+                        _executor,
+                        lambda _h=h, _key=api_key: translate_title_to_chinese(_h, _key),
+                    )
+                    titles_final.append((translated or h).strip() or h)
+                except Exception:
+                    titles_final.append(h)
+        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=titles_final)
         listen_docx.seek(0)
         _results_store[task_id] = {
             "listen_docx": listen_docx.getvalue(),

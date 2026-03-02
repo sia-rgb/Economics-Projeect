@@ -226,6 +226,31 @@ def analyze_article_with_deepseek(
         raise DeepSeekError(f"DeepSeek 返回错误状态码 {status_code}: {last_error}")
 
 
+def translate_title_to_chinese(
+    title: str,
+    api_key: str,
+    timeout_seconds: float = 10.0,
+) -> str:
+    """将英文文章标题翻译为中文，仅返回中文标题。用于口播稿标题兜底。"""
+    if not api_key:
+        raise DeepSeekError("缺少 DeepSeek API Key。")
+    if not title or not title.strip():
+        return title or ""
+    system_msg = "你是一名专业翻译。请将用户给出的英文文章标题翻译成简洁、准确的中文标题。只输出翻译结果，不要引号、不要解释。"
+    user_content = f"请将以下文章标题翻译为中文：\n\n{title.strip()}"
+    status_code, resp_text = _do_api_call_with_system(
+        system_msg, user_content, api_key, timeout_seconds
+    )
+    if status_code != 200:
+        return title.strip()
+    try:
+        data = __import__("json").loads(resp_text)
+        out = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        return out or title.strip()
+    except Exception:
+        return title.strip()
+
+
 def translate_article_with_deepseek(
     article: Article,
     index: int,
