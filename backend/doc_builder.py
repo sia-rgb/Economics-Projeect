@@ -39,8 +39,8 @@ def _extract_article_title(title: str) -> str:
     if match:
         return match.group(1).strip()
     
-    # 提取【文章标题】** :或【文章标题】：后面的内容（支持跨行）
-    match = re.search(r'【文章标题】\*?\*?\s*[：:]\s*(.+)', title_normalized)
+    # 提取「【文章标题】」或「标题」后面的内容（支持跨行）
+    match = re.search(r'(?:【文章标题】|标题)\*?\*?\s*[：:]\s*(.+)', title_normalized)
     if match:
         extracted = match.group(1).strip()
         # 如果提取的内容还包含《》，提取《》中的内容
@@ -49,8 +49,8 @@ def _extract_article_title(title: str) -> str:
             return inner_match.group(1).strip()
         return extracted
     
-    # 去除【文章标题】等前缀标记
-    title_normalized = re.sub(r'【文章标题】\*+\s*[：:]\s*', '', title_normalized)
+    # 去除【文章标题】或「标题」等前缀标记（* 可有可无）
+    title_normalized = re.sub(r'(?:【文章标题】|标题)\**\s*[：:]\s*', '', title_normalized)
     title_normalized = title_normalized.strip()
     
     # 如果还有残留的网址或路径，继续清理
@@ -116,8 +116,8 @@ def _extract_title_from_analysis(analysis: str) -> str | None:
     """从 DeepSeek 分析结果中提取【文章标题】后的中文标题。"""
     if not analysis or not analysis.strip():
         return None
-    # 匹配【文章标题】**：或【文章标题】：后面的内容（可能跨行）
-    match = re.search(r'【文章标题】\*?\*?\s*[：:]\s*(.+)', analysis, re.DOTALL)
+    # 匹配「【文章标题】」或「标题」后的内容（与 Prompt 允许的两种格式一致）
+    match = re.search(r'(?:【文章标题】|标题)\*?\*?\s*[：:]\s*(.+)', analysis, re.DOTALL)
     if not match:
         return None
     extracted = match.group(1).strip()
@@ -296,7 +296,7 @@ def build_docx_from_analyses(
 
         paragraphs_to_add: List[str] = []
         for chunk in chunks:
-            if re.match(r'^【文章标题】\*?\*?\s*[：:]', chunk):
+            if re.match(r'^(?:【文章标题】|标题)\*?\*?\s*[：:]', chunk):
                 continue
             if re.match(r'^\s*\*?\*?\s*标题\s*\*?\*?\s*$', chunk):
                 continue
