@@ -23,6 +23,8 @@ export const UploadPage: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
+  const [resultType, setResultType] = useState<"listen" | "read" | null>(null);
+  const [pendingAction, setPendingAction] = useState<"listen" | "read" | null>(null);
   const [progress, setProgress] = useState(0);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [estimatedTotalMs, setEstimatedTotalMs] = useState(60_000);
@@ -32,6 +34,8 @@ export const UploadPage: React.FC = () => {
     setErrorMessage(null);
     setState("idle");
     setTaskId(null);
+    setResultType(null);
+    setPendingAction(null);
     setProgress(0);
     setStartTime(null);
   };
@@ -51,7 +55,7 @@ export const UploadPage: React.FC = () => {
 
   const API_BASE = (import.meta.env as any).VITE_API_BASE_URL || "";
 
-  const handleUpload = async () => {
+  const runPipeline = async (endpoint: "listen-me" | "read-me", type: "listen" | "read") => {
     if (!file) {
       setErrorMessage("请先选择一个 EPUB 文件。");
       return;
@@ -62,11 +66,13 @@ export const UploadPage: React.FC = () => {
     setState("uploading");
     setErrorMessage(null);
     setTaskId(null);
+    setResultType(null);
+    setPendingAction(type);
 
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const apiUrl = API_BASE ? `${API_BASE}/api/point-me` : "/api/point-me";
+      const apiUrl = API_BASE ? `${API_BASE}/api/${endpoint}` : `/api/${endpoint}`;
       const response = await fetch(apiUrl, { method: "POST", body: formData });
 
       if (!response.ok) {
@@ -85,21 +91,28 @@ export const UploadPage: React.FC = () => {
         setState("error");
         setErrorMessage(detail);
         setProgress(20);
+        setPendingAction(null);
         return;
       }
 
       const data = await response.json();
       const id = data?.task_id ?? null;
       if (id) setTaskId(id);
+      setResultType(type);
       setProgress(90);
       setState("success");
+      setPendingAction(null);
       setTimeout(() => setProgress(100), 150);
     } catch (error) {
       setState("error");
       setErrorMessage((error as Error).message ?? "网络错误，请检查后重试。");
       setProgress(20);
+      setPendingAction(null);
     }
   };
+
+  const handleListenMe = () => runPipeline("listen-me", "listen");
+  const handleReadMe = () => runPipeline("read-me", "read");
 
   const baseName = file?.name ? file.name.replace(/\.epub$/i, "").trim() || "result" : "result";
 
@@ -117,7 +130,7 @@ export const UploadPage: React.FC = () => {
 
   const handleDownloadRead = async () => {
     if (!taskId) {
-      setErrorMessage("请先点击「点我」并等待处理完成后再下载。");
+      setErrorMessage("请先选择「听我」或「读我」并等待处理完成后再下载。");
       return;
     }
     if (isDownloading) return;
@@ -128,7 +141,7 @@ export const UploadPage: React.FC = () => {
       const res = await fetch(url);
       if (!res.ok) {
         if (res.status === 404) {
-          setErrorMessage("任务不存在或已过期，请重新点击「点我」后再下载。");
+          setErrorMessage("任务不存在或已过期，请重新选择听我/读我后再下载。");
           return;
         }
         setErrorMessage(`下载失败 (${res.status})，请稍后重试。`);
@@ -145,7 +158,7 @@ export const UploadPage: React.FC = () => {
 
   const handleDownloadListen = async () => {
     if (!taskId) {
-      setErrorMessage("请先点击「点我」并等待处理完成后再下载。");
+      setErrorMessage("请先选择「听我」或「读我」并等待处理完成后再下载。");
       return;
     }
     if (isDownloading) return;
@@ -156,7 +169,7 @@ export const UploadPage: React.FC = () => {
       const res = await fetch(url);
       if (!res.ok) {
         if (res.status === 404) {
-          setErrorMessage("任务不存在或已过期，请重新点击「点我」后再下载。");
+          setErrorMessage("任务不存在或已过期，请重新选择听我/读我后再下载。");
           return;
         }
         setErrorMessage(`下载失败 (${res.status})，请稍后重试。`);
@@ -169,6 +182,11 @@ export const UploadPage: React.FC = () => {
     } finally {
       setIsDownloading(false);
     }
+  };
+
+  const handleDownload = async () => {
+    if (resultType === "listen") await handleDownloadListen();
+    else if (resultType === "read") await handleDownloadRead();
   };
 
   const isUploading = state === "uploading";
@@ -215,11 +233,19 @@ export const UploadPage: React.FC = () => {
           <div className="flex gap-3">
             <button
               type="button"
-              onClick={handleUpload}
+              onClick={handleListenMe}
+              disabled={!file || isUploading}
+              className="inline-flex items-center justify-center gap-2 rounded-full border border-sky-800 bg-white px-6 py-2.5 text-sm font-semibold text-sky-800 hover:bg-sky-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              <span>{isUploading && pendingAction === "listen" ? "正在处理…" : "听我"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleReadMe}
               disabled={!file || isUploading}
               className="inline-flex items-center justify-center gap-2 rounded-full bg-sky-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-sky-200 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
             >
-              <span>{isUploading ? "正在处理…" : "点我"}</span>
+              <span>{isUploading && pendingAction === "read" ? "正在处理…" : "读我"}</span>
             </button>
           </div>
 
@@ -271,27 +297,20 @@ export const UploadPage: React.FC = () => {
                 {state === "success" && "记得打钱 💰"}
                 {state === "error" && "处理失败"}
               </div>
+              {state === "success" && taskId && (
+                <div className="mt-3 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={isDownloading}
+                    className="inline-flex items-center justify-center gap-2 rounded-full bg-sky-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-sky-200 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <span>{isDownloading ? "正在下载…" : "下载"}</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
-
-          <div className="flex gap-3 justify-end">
-            <button
-              type="button"
-              onClick={handleDownloadListen}
-              disabled={!taskId || isDownloading}
-              className="inline-flex items-center justify-center gap-2 rounded-full border border-sky-800 bg-white px-6 py-2.5 text-sm font-semibold text-sky-800 hover:bg-sky-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              <span>{isDownloading ? "正在下载…" : "听我"}</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleDownloadRead}
-              disabled={!taskId || isDownloading}
-              className="inline-flex items-center justify-center gap-2 rounded-full bg-sky-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-sky-200 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              <span>{isDownloading ? "正在下载…" : "读我"}</span>
-            </button>
-          </div>
         </div>
       </div>
     </div>

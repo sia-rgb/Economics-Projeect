@@ -460,10 +460,134 @@ async def point_me(file: UploadFile = File(...)) -> JSONResponse:
             pass
 
 
+@app.post("/api/listen-me")
+async def listen_me(file: UploadFile = File(...)) -> JSONResponse:
+    """听我：仅生成口播稿，结果供 /api/download/listen/{task_id} 下载。"""
+    import uuid
+    task_id = str(uuid.uuid4())
+    if not file.filename or not file.filename.lower().endswith(".epub"):
+        raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
+        )
+    try:
+        content = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
+        total_n = len(articles)
+        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
+        _processing_status[task_id] = {"status": "processing", "current": 0, "total": total_n}
+
+        tasks = [
+            _process_single_article(art, idx, total_n, api_key, task_id)
+            for idx, art in enumerate(articles, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        successful = [(idx, a) for idx, a, err in results if err is None]
+        if not successful:
+            raise HTTPException(status_code=502, detail="听我：所有文章口播稿生成失败")
+        filtered = [
+            (idx, a) for idx, a in sorted(successful, key=lambda x: x[0])
+            if a.strip() != "【不生成口播稿】"
+            and not _is_cartoon_article(articles[idx - 1], a)
+            and not _should_exclude_article(articles[idx - 1], a)
+        ]
+        analyses = [a for _, a in filtered]
+        arts_listen = [articles[i - 1] for i, _ in filtered]
+        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=None)
+        listen_docx.seek(0)
+        _results_store[task_id] = {
+            "listen_docx": listen_docx.getvalue(),
+            "base_name": base_name,
+        }
+        _processing_status[task_id]["status"] = "completed"
+        return JSONResponse({"task_id": task_id, "status": "completed"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _trace(f"LISTEN_ME_UNHANDLED: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
+    finally:
+        try:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/read-me")
+async def read_me(file: UploadFile = File(...)) -> JSONResponse:
+    """读我：仅生成翻译稿，结果供 /api/download/read/{task_id} 下载。"""
+    import uuid
+    task_id = str(uuid.uuid4())
+    if not file.filename or not file.filename.lower().endswith(".epub"):
+        raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
+        )
+    try:
+        content = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
+        total_n = len(articles)
+        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
+        _processing_status[task_id] = {"status": "processing", "current": 0, "total": total_n}
+
+        tasks = [
+            _process_single_translation(art, idx, total_n, api_key, task_id)
+            for idx, art in enumerate(articles, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        successful = [(idx, t) for idx, t, err in results if err is None]
+        if not successful:
+            raise HTTPException(status_code=502, detail="看我：所有文章翻译失败")
+        filtered = [
+            (idx, t) for idx, t in sorted(successful, key=lambda x: x[0])
+            if not _is_cartoon_translation(articles[idx - 1], t)
+        ]
+        translations = [t for _, t in filtered]
+        arts_read = [articles[idx - 1] for idx, _ in filtered]
+        read_docx = build_docx_from_translations(translations, arts_read)
+        read_docx.seek(0)
+        _results_store[task_id] = {
+            "read_docx": read_docx.getvalue(),
+            "base_name": base_name,
+        }
+        _processing_status[task_id]["status"] = "completed"
+        return JSONResponse({"task_id": task_id, "status": "completed"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _trace(f"READ_ME_UNHANDLED: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
+    finally:
+        try:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 @app.get("/api/download/read/{task_id}")
 def download_read(task_id: str):
     """下载「看我」Word：看+（上传文件名）.docx"""
-    if task_id not in _results_store:
+    if task_id not in _results_store or "read_docx" not in _results_store[task_id]:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     base_name = _results_store[task_id]["base_name"]
     docx_bytes = _results_store[task_id]["read_docx"]
@@ -480,7 +604,7 @@ def download_read(task_id: str):
 @app.get("/api/download/listen/{task_id}")
 def download_listen(task_id: str):
     """下载「听我」Word：听+（上传文件名）.docx"""
-    if task_id not in _results_store:
+    if task_id not in _results_store or "listen_docx" not in _results_store[task_id]:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     base_name = _results_store[task_id]["base_name"]
     docx_bytes = _results_store[task_id]["listen_docx"]

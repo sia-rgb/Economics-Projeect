@@ -52,7 +52,7 @@ AUDIO_SCRIPT_SYSTEM_MESSAGE = f"""# Role
    - 使用："首先"、"比如说"、"这就意味着"、"换句话说"、"值得注意的是"。
 
 # Output Format
-- **标题格式**：第一行必须为「标题：」+ 文章标题（例如「标题：MAGA运动必须面对其外交政策路线上的分歧」），空一行后接正文；不得使用「标题」单独成行或「#### 标题:」等 Markdown 变体。
+- **标题格式**：第一行必须为「标题：」或「【文章标题】：」+ **文章标题的中文翻译**。若原文标题为英文，须先译为中文再填写，不得保留英文标题。例如「标题：MAGA运动必须面对其外交政策路线上的分歧」，空一行后接正文；不得使用「标题」单独成行或「#### 标题:」等 Markdown 变体。
 - **结构**：每篇文章开头为**明确标题**与**正文**两部分；标题与正文之间**不得**出现任何过渡语（如「好的，请听…」「今天我们为您播报…」等），标题后紧接正文。
 - **开头**：禁止在标题前或标题与正文之间插入「这是第X篇，共X篇」「中文有声书，第X篇」等说明句或开场白。
 - **结尾**：文章结尾**不得**有收束/过渡语（如「这篇文章就为您播报到这里。感谢您的收听。」等），正文结束即结束，直接收尾。
@@ -64,12 +64,16 @@ AUDIO_SCRIPT_SYSTEM_MESSAGE = f"""# Role
 
 
 def _build_audio_script_prompt(article: Article, index: int, total: int) -> str:
-    """构建口播逐字稿用的 user prompt：简要说明 + 原文。"""
+    """构建口播逐字稿用的 user prompt：简要说明 + 原标题 + 原文。"""
     content = article.content
     if len(content) > MAX_CONTENT_CHARS:
         content = content[:MAX_CONTENT_CHARS] + "\n\n[... 原文过长已截断 ...]"
+    title_hint = ""
+    if article.title and article.title.strip():
+        title_hint = f"本文原标题（口播稿首行标题请译为中文后填写）：{article.title.strip()}\n\n"
     return (
         "请将以下英文文章转化为中文口播逐字稿。\n\n"
+        f"{title_hint}"
         "待转化的英文原文：\n\n"
         f"{content}"
     )
