@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 
 type UploadState = "idle" | "uploading" | "success" | "error";
 
@@ -10,6 +10,8 @@ const MouseIcon: React.FC<{ className?: string }> = ({ className }) => (
     <path d="M44 50 Q56 42 60 28" stroke="currentColor" strokeWidth="3" fill="none" strokeLinecap="round" />
   </svg>
 );
+
+const POLL_INTERVAL_MS = 3000;
 
 function getEstimatedTotalMs(fileSize: number): number {
   if (fileSize < 2 * 1024 * 1024) return 120_000;
@@ -28,6 +30,8 @@ export const UploadPage: React.FC = () => {
   const [progress, setProgress] = useState(0);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [estimatedTotalMs, setEstimatedTotalMs] = useState(60_000);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const handleFileChange: React.ChangeEventHandler<HTMLInputElement> = (event) => {
     const selected = event.target.files?.[0] ?? null;
     setFile(selected);
@@ -38,30 +42,90 @@ export const UploadPage: React.FC = () => {
     setPendingAction(null);
     setProgress(0);
     setStartTime(null);
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
   };
 
   useEffect(() => {
-    if (state !== "uploading" || startTime === null) return;
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
 
+  useEffect(() => {
+    if (state !== "uploading" || startTime === null) return;
     const interval = setInterval(() => {
       const elapsed = Date.now() - startTime;
       const ratio = Math.min(1, elapsed / estimatedTotalMs);
-      const baseProgress = Math.min(90, 90 * Math.pow(ratio, 0.7));
-      setProgress((prev) => Math.max(prev, baseProgress));
+      const estimatedProgress = Math.min(90, 90 * Math.pow(ratio, 0.7));
+      setProgress((prev) => Math.max(prev, estimatedProgress));
     }, 100);
-
     return () => clearInterval(interval);
   }, [state, startTime, estimatedTotalMs]);
 
   const API_BASE = (import.meta.env as any).VITE_API_BASE_URL || "";
+
+  const pollStatus = (id: string) => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    const check = async () => {
+      try {
+        const url = API_BASE ? `${API_BASE}/api/analyze-status/${id}` : `/api/analyze-status/${id}`;
+        const res = await fetch(url);
+        const statusData = await res.json();
+        if (statusData.status === "processing" || statusData.status === "building_docx") {
+          const total = statusData.total ?? 0;
+          const current = statusData.current ?? 0;
+          if (total > 0) {
+            const realProgress = statusData.status === "building_docx"
+              ? 95
+              : Math.floor((current / total) * 90);
+            setProgress(realProgress);
+          }
+        } else if (statusData.status === "completed") {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setProgress(100);
+          setState("success");
+          setPendingAction(null);
+        } else if (statusData.status === "error") {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setState("error");
+          setErrorMessage(statusData.error ?? "处理失败");
+          setPendingAction(null);
+        } else if (statusData.status === "not_found") {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setState("error");
+          setErrorMessage("任务不存在或已过期");
+          setPendingAction(null);
+        }
+      } catch {
+        // Network error: ignore, next poll will retry
+      }
+    };
+    check();
+    pollIntervalRef.current = setInterval(check, POLL_INTERVAL_MS);
+  };
 
   const runPipeline = async (endpoint: "listen-me" | "read-me", type: "listen" | "read") => {
     if (!file) {
       setErrorMessage("请先选择一个 EPUB 文件。");
       return;
     }
-    setStartTime(Date.now());
-    setEstimatedTotalMs(getEstimatedTotalMs(file.size));
     setProgress(5);
     setState("uploading");
     setErrorMessage(null);
@@ -74,39 +138,28 @@ export const UploadPage: React.FC = () => {
       formData.append("file", file);
       const apiUrl = API_BASE ? `${API_BASE}/api/${endpoint}` : `/api/${endpoint}`;
       const response = await fetch(apiUrl, { method: "POST", body: formData });
+      const data = await response.json();
 
-      if (!response.ok) {
-        let detail = `请求失败 (${response.status})，请稍后重试。`;
-        try {
-          const text = await response.text();
-          const data = text ? JSON.parse(text) : {};
-          if (data?.detail) {
-            detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-          } else if (text) {
-            detail = `[${response.status}] ${text.slice(0, 300)}`;
-          }
-        } catch {
-          /* keep default */
-        }
+      if (!response.ok || !data.task_id) {
+        const detail = data?.detail
+          ? typeof data.detail === "string"
+            ? data.detail
+            : JSON.stringify(data.detail)
+          : `请求失败 (${response.status})，请稍后重试。`;
         setState("error");
         setErrorMessage(detail);
-        setProgress(20);
         setPendingAction(null);
         return;
       }
 
-      const data = await response.json();
-      const id = data?.task_id ?? null;
-      if (id) setTaskId(id);
+      setTaskId(data.task_id);
       setResultType(type);
-      setProgress(90);
-      setState("success");
-      setPendingAction(null);
-      setTimeout(() => setProgress(100), 150);
+      setStartTime(Date.now());
+      setEstimatedTotalMs(getEstimatedTotalMs(file.size));
+      pollStatus(data.task_id);
     } catch (error) {
       setState("error");
       setErrorMessage((error as Error).message ?? "网络错误，请检查后重试。");
-      setProgress(20);
       setPendingAction(null);
     }
   };

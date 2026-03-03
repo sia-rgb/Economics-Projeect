@@ -12,7 +12,7 @@ def verify_env_loaded():
 
 verify_env_loaded()
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,7 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_PARALLEL_TASKS = int(os.getenv("MAX_PARALLEL_TASKS", "20"))
+MAX_PARALLEL_TASKS = int(os.getenv("MAX_PARALLEL_TASKS", "50"))
 _executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_TASKS)
 _semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
 _status_lock = asyncio.Lock()
@@ -196,6 +196,225 @@ async def _process_single_translation(
         except DeepSeekError as e:
             _trace(f"TRANSLATE_ERR: article={index} error={str(e)}")
             return (index, None, str(e))
+
+
+async def process_listen_task_background(
+    task_id: str, tmp_path: str, api_key: str, file_name: str
+) -> None:
+    """Background task: process listen-me (口播稿)."""
+    try:
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            _processing_status[task_id] = {"status": "error", "error": "未能解析出有效文章"}
+            return
+        total_n = len(articles)
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["total"] = total_n
+        base_name = re.sub(r"\.epub$", "", file_name or "", flags=re.I).strip() or "result"
+
+        tasks = [
+            _process_single_article(art, idx, total_n, api_key, task_id)
+            for idx, art in enumerate(articles, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        successful = [(idx, a) for idx, a, err in results if err is None]
+        if not successful:
+            failed = [(idx, e) for idx, a, e in results if e is not None]
+            failed_detail = "; ".join(f"第{i}篇: {e}" for i, e in failed[:5])
+            if len(failed) > 5:
+                failed_detail += f" ... 共{len(failed)}篇失败"
+            _processing_status[task_id] = {"status": "error", "error": f"听我：{failed_detail}"}
+            return
+        filtered = [
+            (idx, a)
+            for idx, a in sorted(successful, key=lambda x: x[0])
+            if a.strip() != "【不生成口播稿】"
+            and not _is_cartoon_article(articles[idx - 1], a)
+            and not _should_exclude_article(articles[idx - 1], a)
+        ]
+        analyses = [a for _, a in filtered]
+        arts_listen = [articles[i - 1] for i, _ in filtered]
+        pure_headings = get_pure_headings(arts_listen, analyses, None)
+        titles_final: List[str] = []
+        for i, h in enumerate(pure_headings):
+            if h == "未命名文章" or not _is_title_mostly_english(h):
+                titles_final.append(h)
+            else:
+                try:
+                    loop = asyncio.get_event_loop()
+                    translated = await loop.run_in_executor(
+                        _executor,
+                        lambda _h=h, _key=api_key: translate_title_to_chinese(_h, _key),
+                    )
+                    titles_final.append((translated or h).strip() or h)
+                except Exception:
+                    titles_final.append(h)
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "building_docx"
+        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=titles_final)
+        listen_docx.seek(0)
+        _results_store[task_id] = {
+            "listen_docx": listen_docx.getvalue(),
+            "base_name": base_name,
+        }
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "completed"
+    except Exception as e:
+        _trace(f"LISTEN_ME_BG: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+async def process_read_task_background(
+    task_id: str, tmp_path: str, api_key: str, file_name: str
+) -> None:
+    """Background task: process read-me (翻译稿)."""
+    try:
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            _processing_status[task_id] = {"status": "error", "error": "未能解析出有效文章"}
+            return
+        total_n = len(articles)
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["total"] = total_n
+        base_name = re.sub(r"\.epub$", "", file_name or "", flags=re.I).strip() or "result"
+
+        tasks = [
+            _process_single_translation(art, idx, total_n, api_key, task_id)
+            for idx, art in enumerate(articles, start=1)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        successful = [(idx, t) for idx, t, err in results if err is None]
+        if not successful:
+            failed = [(idx, e) for idx, t, e in results if e is not None]
+            failed_detail = "; ".join(f"第{i}篇: {e}" for i, e in failed[:5])
+            if len(failed) > 5:
+                failed_detail += f" ... 共{len(failed)}篇失败"
+            _processing_status[task_id] = {"status": "error", "error": f"看我：{failed_detail}"}
+            return
+        filtered = [
+            (idx, t)
+            for idx, t in sorted(successful, key=lambda x: x[0])
+            if not _is_cartoon_translation(articles[idx - 1], t)
+        ]
+        translations = [t for _, t in filtered]
+        arts_read = [articles[idx - 1] for idx, _ in filtered]
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "building_docx"
+        read_docx = build_docx_from_translations(translations, arts_read)
+        read_docx.seek(0)
+        _results_store[task_id] = {
+            "read_docx": read_docx.getvalue(),
+            "base_name": base_name,
+        }
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "completed"
+    except Exception as e:
+        _trace(f"READ_ME_BG: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+async def process_point_task_background(
+    task_id: str, tmp_path: str, api_key: str, file_name: str
+) -> None:
+    """Background task: process point-me (听我 + 读我)."""
+    try:
+        articles = extract_articles_from_epub(tmp_path)
+        if not articles:
+            _processing_status[task_id] = {"status": "error", "error": "未能解析出有效文章"}
+            return
+        total_n = len(articles)
+        base_name = re.sub(r"\.epub$", "", file_name or "", flags=re.I).strip() or "result"
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["total"] = 2 * total_n
+
+        async def flow_listen() -> tuple[list[str], list, list[tuple[int, str]]]:
+            tasks = [
+                _process_single_article(art, idx, total_n, api_key, task_id)
+                for idx, art in enumerate(articles, start=1)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            successful = [(idx, a) for idx, a, err in results if err is None]
+            if not successful:
+                raise ValueError("听我：所有文章口播稿生成失败")
+            filtered = [
+                (idx, a)
+                for idx, a in sorted(successful, key=lambda x: x[0])
+                if a.strip() != "【不生成口播稿】"
+                and not _is_cartoon_article(articles[idx - 1], a)
+                and not _should_exclude_article(articles[idx - 1], a)
+            ]
+            analyses = [a for _, a in filtered]
+            arts = [articles[i - 1] for i, _ in filtered]
+            return (analyses, arts, filtered)
+
+        async def flow_read() -> tuple[list[str], list, list[tuple[int, str]]]:
+            tasks = [
+                _process_single_translation(art, idx, total_n, api_key, task_id)
+                for idx, art in enumerate(articles, start=1)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            successful = [(idx, t) for idx, t, err in results if err is None]
+            if not successful:
+                raise ValueError("看我：所有文章翻译失败")
+            filtered = [
+                (idx, t)
+                for idx, t in sorted(successful, key=lambda x: x[0])
+                if not _is_cartoon_translation(articles[idx - 1], t)
+            ]
+            translations = [t for _, t in filtered]
+            arts = [articles[i - 1] for i, _ in filtered]
+            return (translations, arts, filtered)
+
+        (analyses, arts_listen, listen_filtered), (translations, arts_read, read_filtered) = (
+            await asyncio.gather(flow_listen(), flow_read())
+        )
+        read_title_map = {idx: _parse_translation(t)[0] for idx, t in read_filtered}
+        titles_for_listen = [read_title_map.get(idx, "") for idx, _ in listen_filtered]
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "building_docx"
+        listen_docx = build_docx_from_analyses(
+            analyses, arts_listen, titles_override=titles_for_listen
+        )
+        read_docx = build_docx_from_translations(translations, arts_read)
+        listen_docx.seek(0)
+        read_docx.seek(0)
+        _results_store[task_id] = {
+            "read_docx": read_docx.getvalue(),
+            "listen_docx": listen_docx.getvalue(),
+            "base_name": base_name,
+        }
+        async with _status_lock:
+            if task_id in _processing_status:
+                _processing_status[task_id]["status"] = "completed"
+    except Exception as e:
+        _trace(f"POINT_ME_BG: {type(e).__name__}: {e}")
+        _processing_status[task_id] = {"status": "error", "error": str(e)}
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 @app.get("/api/analyze-status/{task_id}")
@@ -388,9 +607,12 @@ async def translate_epub(file: UploadFile = File(...)) -> StreamingResponse:
 
 
 @app.post("/api/point-me")
-async def point_me(file: UploadFile = File(...)) -> JSONResponse:
+async def point_me(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+) -> JSONResponse:
     """点我：同时跑「看我」（书面翻译）与「听我」（口播稿），结果按 task_id 存，供读我/听我下载。"""
     import uuid
+
     task_id = str(uuid.uuid4())
     if not file.filename or not file.filename.lower().endswith(".epub"):
         raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
@@ -400,86 +622,24 @@ async def point_me(file: UploadFile = File(...)) -> JSONResponse:
             status_code=500,
             detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
         )
-    try:
-        content = await file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        articles = extract_articles_from_epub(tmp_path)
-        if not articles:
-            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
-        total_n = len(articles)
-        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
-        _processing_status[task_id] = {"status": "processing", "current": 0, "total": 2 * total_n}
-
-        async def flow_listen() -> tuple[list[str], list, list[tuple[int, str]]]:
-            tasks = [
-                _process_single_article(art, idx, total_n, api_key, task_id)
-                for idx, art in enumerate(articles, start=1)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            successful = [(idx, a) for idx, a, err in results if err is None]
-            if not successful:
-                raise HTTPException(status_code=502, detail="听我：所有文章口播稿生成失败")
-            filtered = [
-                (idx, a) for idx, a in sorted(successful, key=lambda x: x[0])
-                if a.strip() != "【不生成口播稿】"
-                and not _is_cartoon_article(articles[idx - 1], a)
-                and not _should_exclude_article(articles[idx - 1], a)
-            ]
-            analyses = [a for _, a in filtered]
-            arts = [articles[i - 1] for i, _ in filtered]
-            return (analyses, arts, filtered)
-
-        async def flow_read() -> tuple[list[str], list, list[tuple[int, str]]]:
-            tasks = [
-                _process_single_translation(art, idx, total_n, api_key, task_id)
-                for idx, art in enumerate(articles, start=1)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            successful = [(idx, t) for idx, t, err in results if err is None]
-            if not successful:
-                raise HTTPException(status_code=502, detail="看我：所有文章翻译失败")
-            filtered = [
-                (idx, t) for idx, t in sorted(successful, key=lambda x: x[0])
-                if not _is_cartoon_translation(articles[idx - 1], t)
-            ]
-            translations = [t for _, t in filtered]
-            arts = [articles[i - 1] for i, _ in filtered]
-            return (translations, arts, filtered)
-
-        (analyses, arts_listen, listen_filtered), (translations, arts_read, read_filtered) = await asyncio.gather(flow_listen(), flow_read())
-        read_title_map = {idx: _parse_translation(t)[0] for idx, t in read_filtered}
-        titles_for_listen = [read_title_map.get(idx, "") for idx, _ in listen_filtered]
-        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=titles_for_listen)
-        read_docx = build_docx_from_translations(translations, arts_read)
-        listen_docx.seek(0)
-        read_docx.seek(0)
-        _results_store[task_id] = {
-            "read_docx": read_docx.getvalue(),
-            "listen_docx": listen_docx.getvalue(),
-            "base_name": base_name,
-        }
-        _processing_status[task_id]["status"] = "completed"
-        return JSONResponse({"task_id": task_id, "status": "completed"})
-    except HTTPException:
-        raise
-    except Exception as e:
-        _trace(f"POINT_ME_UNHANDLED: {type(e).__name__}: {e}")
-        _processing_status[task_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
-    finally:
-        try:
-            if "tmp_path" in locals() and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    _processing_status[task_id] = {"status": "processing", "current": 0, "total": 0}
+    background_tasks.add_task(
+        process_point_task_background, task_id, tmp_path, api_key, file.filename or ""
+    )
+    return JSONResponse({"task_id": task_id, "status": "processing"})
 
 
 @app.post("/api/listen-me")
-async def listen_me(file: UploadFile = File(...)) -> JSONResponse:
+async def listen_me(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+) -> JSONResponse:
     """听我：仅生成口播稿，结果供 /api/download/listen/{task_id} 下载。"""
     import uuid
+
     task_id = str(uuid.uuid4())
     if not file.filename or not file.filename.lower().endswith(".epub"):
         raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
@@ -489,74 +649,24 @@ async def listen_me(file: UploadFile = File(...)) -> JSONResponse:
             status_code=500,
             detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
         )
-    try:
-        content = await file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        articles = extract_articles_from_epub(tmp_path)
-        if not articles:
-            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
-        total_n = len(articles)
-        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
-        _processing_status[task_id] = {"status": "processing", "current": 0, "total": total_n}
-
-        tasks = [
-            _process_single_article(art, idx, total_n, api_key, task_id)
-            for idx, art in enumerate(articles, start=1)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        successful = [(idx, a) for idx, a, err in results if err is None]
-        if not successful:
-            raise HTTPException(status_code=502, detail="听我：所有文章口播稿生成失败")
-        filtered = [
-            (idx, a) for idx, a in sorted(successful, key=lambda x: x[0])
-            if a.strip() != "【不生成口播稿】"
-            and not _is_cartoon_article(articles[idx - 1], a)
-            and not _should_exclude_article(articles[idx - 1], a)
-        ]
-        analyses = [a for _, a in filtered]
-        arts_listen = [articles[i - 1] for i, _ in filtered]
-        pure_headings = get_pure_headings(arts_listen, analyses, None)
-        titles_final: List[str] = []
-        for i, h in enumerate(pure_headings):
-            if h == "未命名文章" or not _is_title_mostly_english(h):
-                titles_final.append(h)
-            else:
-                try:
-                    translated = await asyncio.get_event_loop().run_in_executor(
-                        _executor,
-                        lambda _h=h, _key=api_key: translate_title_to_chinese(_h, _key),
-                    )
-                    titles_final.append((translated or h).strip() or h)
-                except Exception:
-                    titles_final.append(h)
-        listen_docx = build_docx_from_analyses(analyses, arts_listen, titles_override=titles_final)
-        listen_docx.seek(0)
-        _results_store[task_id] = {
-            "listen_docx": listen_docx.getvalue(),
-            "base_name": base_name,
-        }
-        _processing_status[task_id]["status"] = "completed"
-        return JSONResponse({"task_id": task_id, "status": "completed"})
-    except HTTPException:
-        raise
-    except Exception as e:
-        _trace(f"LISTEN_ME_UNHANDLED: {type(e).__name__}: {e}")
-        _processing_status[task_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
-    finally:
-        try:
-            if "tmp_path" in locals() and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    _processing_status[task_id] = {"status": "processing", "current": 0, "total": 0}
+    background_tasks.add_task(
+        process_listen_task_background, task_id, tmp_path, api_key, file.filename or ""
+    )
+    return JSONResponse({"task_id": task_id, "status": "processing"})
 
 
 @app.post("/api/read-me")
-async def read_me(file: UploadFile = File(...)) -> JSONResponse:
+async def read_me(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+) -> JSONResponse:
     """读我：仅生成翻译稿，结果供 /api/download/read/{task_id} 下载。"""
     import uuid
+
     task_id = str(uuid.uuid4())
     if not file.filename or not file.filename.lower().endswith(".epub"):
         raise HTTPException(status_code=400, detail="仅支持 EPUB 文件。")
@@ -566,52 +676,15 @@ async def read_me(file: UploadFile = File(...)) -> JSONResponse:
             status_code=500,
             detail="后端未配置 DEEPSEEK_API_KEY 环境变量，请在服务器上设置后重试。",
         )
-    try:
-        content = await file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        articles = extract_articles_from_epub(tmp_path)
-        if not articles:
-            raise HTTPException(status_code=400, detail="未能从 EPUB 中解析出有效文章。")
-        total_n = len(articles)
-        base_name = re.sub(r"\.epub$", "", file.filename or "", flags=re.I).strip() or "result"
-        _processing_status[task_id] = {"status": "processing", "current": 0, "total": total_n}
-
-        tasks = [
-            _process_single_translation(art, idx, total_n, api_key, task_id)
-            for idx, art in enumerate(articles, start=1)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        successful = [(idx, t) for idx, t, err in results if err is None]
-        if not successful:
-            raise HTTPException(status_code=502, detail="看我：所有文章翻译失败")
-        filtered = [
-            (idx, t) for idx, t in sorted(successful, key=lambda x: x[0])
-            if not _is_cartoon_translation(articles[idx - 1], t)
-        ]
-        translations = [t for _, t in filtered]
-        arts_read = [articles[idx - 1] for idx, _ in filtered]
-        read_docx = build_docx_from_translations(translations, arts_read)
-        read_docx.seek(0)
-        _results_store[task_id] = {
-            "read_docx": read_docx.getvalue(),
-            "base_name": base_name,
-        }
-        _processing_status[task_id]["status"] = "completed"
-        return JSONResponse({"task_id": task_id, "status": "completed"})
-    except HTTPException:
-        raise
-    except Exception as e:
-        _trace(f"READ_ME_UNHANDLED: {type(e).__name__}: {e}")
-        _processing_status[task_id] = {"status": "error", "error": str(e)}
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {e}") from e
-    finally:
-        try:
-            if "tmp_path" in locals() and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
+    content = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    _processing_status[task_id] = {"status": "processing", "current": 0, "total": 0}
+    background_tasks.add_task(
+        process_read_task_background, task_id, tmp_path, api_key, file.filename or ""
+    )
+    return JSONResponse({"task_id": task_id, "status": "processing"})
 
 
 @app.get("/api/download/read/{task_id}")
