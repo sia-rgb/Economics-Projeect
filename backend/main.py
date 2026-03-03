@@ -47,13 +47,14 @@ app = FastAPI(title="EPUB Analyst")
 
 # 配置CORS，允许跨域请求
 # 生产环境建议指定具体域名，开发环境可以使用 "*"
-import os
 allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
 if allowed_origins == ["*"]:
-    # 开发环境或未配置时允许所有来源
-    cors_origins = ["*"]
+    # 默认允许 GitHub Pages 与本地开发
+    cors_origins = [
+        "https://sia-rgb.github.io",
+        "http://localhost:5173",
+    ]
 else:
-    # 生产环境使用配置的域名列表
     cors_origins = [origin.strip() for origin in allowed_origins]
 
 app.add_middleware(
