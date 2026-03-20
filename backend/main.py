@@ -72,23 +72,31 @@ _status_lock = asyncio.Lock()
 
 # 速率限制器配置
 API_RATE_LIMIT = int(os.getenv("API_RATE_LIMIT", "5"))  # 每秒最多请求数
-_rate_limit_last_call = 0.0
-_rate_limit_lock = asyncio.Lock()
 
-async def _rate_limiter():
-    """简单的速率限制器，控制API请求频率"""
-    if API_RATE_LIMIT <= 0:
-        return
+class RateLimiter:
+    """简单的速率限制器类"""
+    def __init__(self, rate_limit: int):
+        self.rate_limit = rate_limit
+        self.last_call_time = 0.0
+        self.lock = asyncio.Lock()
 
-    async with _rate_limit_lock:
-        now = asyncio.get_event_loop().time()
-        elapsed = now - _rate_limit_last_call
-        min_interval = 1.0 / API_RATE_LIMIT
+    async def wait(self):
+        """等待直到可以发送下一个请求"""
+        if self.rate_limit <= 0:
+            return
 
-        if elapsed < min_interval:
-            await asyncio.sleep(min_interval - elapsed)
+        async with self.lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self.last_call_time
+            min_interval = 1.0 / self.rate_limit
 
-        _rate_limit_last_call = asyncio.get_event_loop().time()
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+
+            self.last_call_time = asyncio.get_event_loop().time()
+
+# 创建全局速率限制器实例
+_rate_limiter = RateLimiter(API_RATE_LIMIT)
 
 _processing_status: dict[str, dict] = {}  # 存储处理状态
 _results_store: dict[str, dict] = {}  # task_id -> { "read_docx": bytes, "listen_docx": bytes, "base_name": str }
@@ -170,7 +178,7 @@ async def _process_single_article(
     """处理单篇文章，返回 (index, analysis, error)。成功时 error 为 None。"""
     async with _semaphore:
         # 应用速率限制
-        await _rate_limiter()
+        await _rate_limiter.wait()
         _trace(f"STEP3: calling DeepSeek for article {index}/{total}")
         try:
             loop = asyncio.get_event_loop()
@@ -202,7 +210,7 @@ async def _process_single_translation(
     """处理单篇翻译，返回 (index, translation, error)。成功时 error 为 None。"""
     async with _semaphore:
         # 应用速率限制
-        await _rate_limiter()
+        await _rate_limiter.wait()
         _trace(f"TRANSLATE: calling DeepSeek for article {index}/{total}")
         try:
             loop = asyncio.get_event_loop()
