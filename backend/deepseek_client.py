@@ -2,16 +2,215 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
 import httpx
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+import json
 
 from epub_processing import Article, get_audio_script_skip_rules_text
 
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
 DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+# 连接池大小配置
+DEEPSEEK_MAX_CONNECTIONS = int(os.getenv("DEEPSEEK_MAX_CONNECTIONS", "10"))
+DEEPSEEK_MAX_KEEPALIVE = int(os.getenv("DEEPSEEK_MAX_KEEPALIVE", "30"))
+DEEPSEEK_REQUEST_TIMEOUT = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120.0"))
+
+# 客户端实例缓存
+_client_cache = {}
+_client_cache_lock = asyncio.Lock()
+
+
+@dataclass
+class RequestConfig:
+    """API请求配置"""
+    timeout: float = DEEPSEEK_REQUEST_TIMEOUT
+    max_retries: int = 3
+    retry_delay: float = 2.0
+
+
+class DeepSeekClient:
+    """DeepSeek API客户端，支持连接复用和批量处理"""
+
+    def __init__(self, api_key: str, base_url: Optional[str] = None, max_connections: int = DEEPSEEK_MAX_CONNECTIONS):
+        self.api_key = api_key
+        self.base_url = (base_url or DEEPSEEK_API_BASE).rstrip('/')
+        self.max_connections = max_connections
+
+        # 创建异步HTTP客户端，启用连接池
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=DEEPSEEK_MAX_KEEPALIVE
+        )
+        timeout = httpx.Timeout(
+            connect=30.0,
+            read=DEEPSEEK_REQUEST_TIMEOUT,
+            write=30.0,
+            pool=30.0
+        )
+
+        self._client = httpx.AsyncClient(
+            limits=limits,
+            timeout=timeout,
+            http2=True  # 启用HTTP/2以提高性能
+        )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # 不自动关闭，客户端是长期存在的
+        pass
+
+    async def close(self):
+        """关闭HTTP客户端"""
+        if hasattr(self, '_client') and self._client:
+            await self._client.aclose()
+
+    async def _make_request(
+        self,
+        messages: List[Dict[str, str]],
+        system_message: Optional[str] = None,
+        temperature: float = 0.7,
+        config: Optional[RequestConfig] = None
+    ) -> Dict[str, Any]:
+        """执行API请求，支持指数退避重试"""
+        config = config or RequestConfig()
+        url = f"{self.base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # 构建消息列表，如果提供了系统消息则添加
+        msg_list = []
+        if system_message:
+            msg_list.append({"role": "system", "content": system_message})
+        msg_list.extend(messages)
+
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": msg_list,
+            "temperature": temperature,
+        }
+
+        last_exc = None
+        for attempt in range(config.max_retries):
+            try:
+                response = await self._client.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=config.timeout
+                )
+
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code in [429, 500, 502, 503, 504]:
+                    # 可重试的错误
+                    if attempt < config.max_retries - 1:
+                        delay = config.retry_delay * (2 ** attempt)  # 指数退避
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        raise DeepSeekError(f"API返回错误状态码 {response.status_code}: {response.text}")
+                else:
+                    # 不可重试的错误
+                    raise DeepSeekError(f"API返回错误状态码 {response.status_code}: {response.text}")
+
+            except (httpx.HTTPError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt < config.max_retries - 1:
+                    delay = config.retry_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    raise DeepSeekError(f"调用DeepSeek失败: {e}") from e
+
+        if last_exc is not None:
+            raise DeepSeekError(f"调用DeepSeek失败: {last_exc}")
+        raise DeepSeekError("未知错误")
+
+    async def chat_completion(
+        self,
+        user_content: str,
+        system_message: Optional[str] = None,
+        temperature: float = 0.7,
+        config: Optional[RequestConfig] = None
+    ) -> str:
+        """发送单条消息并获取响应"""
+        messages = [{"role": "user", "content": user_content}]
+        result = await self._make_request(messages, system_message, temperature, config)
+        return result["choices"][0]["message"]["content"].strip()
+
+    async def batch_chat_completion(
+        self,
+        requests: List[Dict[str, Any]],
+        config: Optional[RequestConfig] = None
+    ) -> List[str]:
+        """批量处理多个请求，并发执行"""
+        tasks = []
+        for req in requests:
+            user_content = req.get("user_content", "")
+            system_message = req.get("system_message")
+            temperature = req.get("temperature", 0.7)
+            tasks.append(self.chat_completion(user_content, system_message, temperature, config))
+
+        # 并发执行所有任务
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 处理结果，将异常转换为错误消息
+        final_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                raise DeepSeekError(f"第{i+1}个请求失败: {result}")
+            final_results.append(result)
+
+        return final_results
+
+
+def _run_async_in_sync_context(coro):
+    """在同步上下文中运行异步协程"""
+    try:
+        # 尝试获取当前线程的事件循环
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(coro)
+    except RuntimeError as e:
+        if "There is no current event loop in thread" in str(e) or "no running event loop" in str(e):
+            # 当前线程没有事件循环，创建新的
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+        else:
+            raise
+
 
 class DeepSeekError(Exception):
     """封装 DeepSeek 相关错误。"""
+
+
+def get_deepseek_client(api_key: str, base_url: Optional[str] = None) -> DeepSeekClient:
+    """获取或创建DeepSeekClient实例（单例模式）"""
+    key = (api_key, base_url or DEEPSEEK_API_BASE)
+
+    # 注意：这个函数可能在多线程环境中调用，但Python的GIL提供一定保护
+    # 对于简单用例，这应该足够
+    if key not in _client_cache:
+        _client_cache[key] = DeepSeekClient(api_key, base_url)
+
+    return _client_cache[key]
+
+
+async def close_all_clients():
+    """关闭所有缓存的客户端"""
+    for client in _client_cache.values():
+        await client.close()
+    _client_cache.clear()
 
 
 # DeepSeek 上下文限制约 32k tokens，约 12 万字符；单篇正文截断以留出 prompt 空间
@@ -131,39 +330,40 @@ def _do_api_call_with_system(
     timeout_seconds: float,
 ) -> tuple[int, str]:
     """执行 API 调用，使用指定的 system message，返回 (status_code, response_text)。连接中断时自动重试。"""
-    url = f"{DEEPSEEK_API_BASE.rstrip('/')}/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.7,
-    }
-    timeout_config = httpx.Timeout(
-        connect=30.0, read=timeout_seconds, write=30.0, pool=30.0
-    )
-    last_exc = None
-    for attempt in range(3):
+    # 使用新的异步客户端，但在同步上下文中运行
+    async def _async_call():
+        config = RequestConfig(timeout=timeout_seconds)
+        client = get_deepseek_client(api_key)
         try:
-            with httpx.Client(timeout=timeout_config) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                body = resp.text
-            return (resp.status_code, body)
-        except httpx.HTTPError as e:
-            last_exc = e
-            msg = str(e).lower()
-            if attempt < 2 and ("chunked" in msg or "peer closed" in msg or "connection" in msg or "incomplete" in msg):
-                time.sleep(2.0 * (attempt + 1))
-                continue
-            raise DeepSeekError(f"调用 DeepSeek 失败：{e}") from e
-    if last_exc is not None:
-        raise DeepSeekError(f"调用 DeepSeek 失败：{last_exc}") from last_exc
-    return (500, "")
+            # 直接使用_make_request获取原始API响应
+            messages = [{"role": "user", "content": user_content}]
+            response_data = await client._make_request(
+                messages=messages,
+                system_message=system_msg,
+                temperature=0.7,
+                config=config
+            )
+            # 返回状态码200和JSON字符串
+            return (200, json.dumps(response_data))
+        except DeepSeekError as e:
+            # 从异常中提取状态码信息
+            msg = str(e)
+            if "API返回错误状态码" in msg:
+                # 提取状态码
+                import re
+                match = re.search(r"API返回错误状态码 (\d+):", msg)
+                if match:
+                    status_code = int(match.group(1))
+                    # 提取错误消息（保持原始格式）
+                    error_parts = msg.split(":", 1)
+                    error_msg = error_parts[1] if len(error_parts) > 1 else msg
+                    return (status_code, error_msg.strip())
+            # 其他错误返回500
+            return (500, msg)
+        except Exception as e:
+            return (500, str(e))
+
+    return _run_async_in_sync_context(_async_call())
 
 
 def _do_api_call(
