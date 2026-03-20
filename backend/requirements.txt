@@ -5,5 +5,5 @@ python-multipart
 ebooklib
 beautifulsoup4
 python-docx
-httpx
+httpx[http2]
 python-dotenv
