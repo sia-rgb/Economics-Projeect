@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import asyncio
+import threading
 import httpx
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
@@ -18,8 +19,9 @@ DEEPSEEK_MAX_CONNECTIONS = int(os.getenv("DEEPSEEK_MAX_CONNECTIONS", "10"))
 DEEPSEEK_MAX_KEEPALIVE = int(os.getenv("DEEPSEEK_MAX_KEEPALIVE", "30"))
 DEEPSEEK_REQUEST_TIMEOUT = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120.0"))
 
-# 客户端实例缓存
-_client_cache = {}
+# 客户端实例缓存（线程局部存储）
+_thread_local = threading.local()
+_client_cache = {}  # 向后兼容，暂时保留
 _client_cache_lock = asyncio.Lock()
 
 
@@ -176,6 +178,11 @@ def _run_async_in_sync_context(coro):
     try:
         # 尝试获取当前线程的事件循环
         loop = asyncio.get_event_loop()
+        # 检查事件循环是否已关闭
+        if loop.is_closed():
+            # 事件循环已关闭，创建新的
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
     except RuntimeError as e:
         if "There is no current event loop in thread" in str(e) or "no running event loop" in str(e):
@@ -185,9 +192,20 @@ def _run_async_in_sync_context(coro):
             try:
                 return loop.run_until_complete(coro)
             finally:
-                loop.close()
+                if not loop.is_closed():
+                    loop.close()
         else:
             raise
+    except Exception as e:
+        # 其他异常，如"Event loop is closed"
+        if "Event loop is closed" in str(e) or "loop is closed" in str(e).lower():
+            # 创建新的事件循环并重试
+            import sys
+            print(f"[DEBUG] Event loop was closed, creating new one: {e}", file=sys.stderr)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        raise
 
 
 class DeepSeekError(Exception):
@@ -195,22 +213,31 @@ class DeepSeekError(Exception):
 
 
 def get_deepseek_client(api_key: str, base_url: Optional[str] = None) -> DeepSeekClient:
-    """获取或创建DeepSeekClient实例（单例模式）"""
+    """获取或创建DeepSeekClient实例（线程局部单例模式）"""
     key = (api_key, base_url or DEEPSEEK_API_BASE)
 
-    # 注意：这个函数可能在多线程环境中调用，但Python的GIL提供一定保护
-    # 对于简单用例，这应该足够
-    if key not in _client_cache:
-        _client_cache[key] = DeepSeekClient(api_key, base_url)
+    # 使用线程局部存储，每个线程有自己的客户端实例
+    if not hasattr(_thread_local, 'client_cache'):
+        _thread_local.client_cache = {}
 
-    return _client_cache[key]
+    if key not in _thread_local.client_cache:
+        _thread_local.client_cache[key] = DeepSeekClient(api_key, base_url)
+
+    return _thread_local.client_cache[key]
 
 
 async def close_all_clients():
-    """关闭所有缓存的客户端"""
+    """关闭所有缓存的客户端（包括线程局部存储中的客户端）"""
+    # 关闭全局缓存中的客户端（向后兼容）
     for client in _client_cache.values():
         await client.close()
     _client_cache.clear()
+
+    # 关闭当前线程局部存储中的客户端
+    if hasattr(_thread_local, 'client_cache'):
+        for client in _thread_local.client_cache.values():
+            await client.close()
+        _thread_local.client_cache.clear()
 
 
 # DeepSeek 上下文限制约 32k tokens，约 12 万字符；单篇正文截断以留出 prompt 空间

@@ -6,9 +6,9 @@ load_dotenv()
 def verify_env_loaded():
     test_env_var = os.getenv("DEEPSEEK_API_KEY")
     if test_env_var:
-        print(f"✅ .env 文件加载成功，示例环境变量（部分隐藏）：{test_env_var[:8]}...")
+        print(f"[OK] .env 文件加载成功，示例环境变量（部分隐藏）：{test_env_var[:8]}...")
     else:
-        print("⚠️  未加载到指定环境变量，请检查 .env 文件是否存在或变量名是否正确")
+        print("[WARN] 未加载到指定环境变量，请检查 .env 文件是否存在或变量名是否正确")
 
 verify_env_loaded()
 
